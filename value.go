@@ -456,10 +456,16 @@ type valueLog struct {
 	garbageCh      chan struct{}
 	lfDiscardStats *lfDiscardStats
 
-	// CloudSync
+	// CloudSync related channel and controller
 	cloudCloser *y.Closer
 	cloudSyncCh chan WriteInfo
 
+	// CloudSync buffer
+	cloudSyncBufferSize uint32
+	cloudSyncBuffer []byte
+
+	// Cloud file description
+	cloudFd *os.File
 	cloudDir string
 	cloudMaxFid uint32
 	cloudWritableLogOffset uint32
@@ -550,12 +556,21 @@ func (vlog *valueLog) createVlogFile(fid uint32) (*logFile, error) {
 	return lf, nil
 }
 
-func (vlog *valueLog) openOrCreateCloudFiles() {
+func (vlog *valueLog) openOrCreateCloudFiles() error {
 	vlog.cloudDir = "cloud/"
 	vlog.cloudMaxFid = vlog.maxFid
 	// TODO: vlog.writableLogOffset is initialized in Replay when reopen a database
-	// May need to change this line later
+	// May need to change this writable offset later
 	vlog.cloudWritableLogOffset = 0
+
+	// Create the cloud file for sync
+	flags := os.O_RDWR | os.O_CREATE | os.O_EXCL
+	var err error
+	vlog.cloudFd, err = os.OpenFile(vlogFilePath(vlog.cloudDir, vlog.cloudMaxFid), flags, 0666)
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 func (vlog *valueLog) Open(kv *DB, opt Options) error {
@@ -572,7 +587,13 @@ func (vlog *valueLog) Open(kv *DB, opt Options) error {
 	vlog.lfDiscardStats = &lfDiscardStats{m: make(map[uint32]int64)}
 
 	// CloudSync
-	vlog.openOrCreateCloudFiles()
+	if err := vlog.openOrCreateCloudFiles(); err != nil {
+		return errors.Wrapf(err, "Unable to open cloud sync file")
+	}
+
+	// Currently use the sync buffer size as 10M
+	vlog.cloudSyncBufferSize = 10 * 1024 * 1024
+	vlog.cloudSyncBuffer = make([]byte, vlog.cloudSyncBufferSize)
 
 	// TODO: Currently set this channel max size to 100
 	vlog.cloudSyncCh = make(chan WriteInfo, 100)
@@ -590,15 +611,81 @@ func (vlog *valueLog) doCloudSync(lc *y.Closer){
 	var maxWi WriteInfo
 	var wi WriteInfo
 
-	syncData := func(){
-		// TODO: Currently it is just a print, update it with some file IO later
-		fmt.Printf("sync to: %d %d \n", maxWi.fid, maxWi.offset)
-		// Sleep for 500ms, emulate data sync
-		time.Sleep(500 * time.Millisecond)
+	syncSingleFile := func(is_whole bool, is_close bool, offset uint32) {
+		// Sync vlog.cloudMaxFid to cloud
+		// If <is_whole> is true, sync whole file
+		// If <is_whole> is false, sync current file to offset
+		// <is_close> means if it is during database close
+		fd := vlog.filesMap[vlog.cloudMaxFid].fd
+		
+		ending := int64(offset)
+		current := int64(vlog.cloudWritableLogOffset)
 
-		// update vlog data to maxWi
-		vlog.cloudMaxFid = maxWi.fid
-		vlog.cloudWritableLogOffset = maxWi.offset
+		for {
+			// In non whole sync mode, make sure every sync has 10M data
+			if is_whole == false && uint32(ending - current) < vlog.cloudSyncBufferSize {
+				break
+			}
+
+			n_read, err := fd.ReadAt(vlog.cloudSyncBuffer, current)
+			log.Println(current, n_read, offset)
+			if err != nil {
+				//log.Println("Error in cloud sync read")
+				//log.Println(err)
+			}
+
+			// In whole file sync, write data all you read
+			// In not whole file sync, write at most to ending
+			n_write := n_read
+			if is_whole == false {
+				max_write := int(ending - current)
+				if n_write > max_write {
+					n_write = max_write
+				}
+			}
+			
+			n_write_real, err := vlog.cloudFd.Write(vlog.cloudSyncBuffer[:n_write])
+			if err != nil {
+				log.Println("Error in cloud sync write")
+			}
+			current += int64(n_write_real)
+
+			// If the data you write is not the whole buffer size,
+			// this means you reach the end of a file, or reach the maximum offset
+			if uint32(n_write) != vlog.cloudSyncBufferSize {
+				break;
+			}
+		}
+
+		// If current file is synced to end, create a new file for sync
+		// If during database close, don't need to do this
+		if is_whole == true && is_close == false {
+			// If the whole file is synced, close file and open a new file for sync
+			vlog.cloudMaxFid += 1
+			vlog.cloudWritableLogOffset = 0
+
+			vlog.cloudFd.Close()
+			var err error
+			flags := os.O_RDWR | os.O_CREATE | os.O_EXCL
+			vlog.cloudFd, err = os.OpenFile(vlogFilePath(vlog.cloudDir, vlog.cloudMaxFid), flags, 0666)
+			if err != nil {
+				log.Println("Error creating new log file")
+			}
+		} else {
+			vlog.cloudWritableLogOffset = uint32(current)
+		}
+	}
+
+	syncData := func(fid, offset uint32, is_close bool){
+		start_fid := int(vlog.cloudMaxFid)
+		end_fid := int(fid)
+		// For all previous file, sync whole file
+		for i := start_fid; i < end_fid; i++ {
+			syncSingleFile(true, is_close, 0)
+		}
+		// For current file, sync to offset
+		// Or if during database close, sync to whole last file
+		syncSingleFile(false || is_close, is_close, offset)
 		// Unblock the queue
 		<- pendingCh
 	}
@@ -619,9 +706,14 @@ func (vlog *valueLog) doCloudSync(lc *y.Closer){
 
 		for{
 			// If new sync request has come
-			maxWi.fid = max(maxWi.fid, wi.fid)
-			maxWi.offset = max(maxWi.offset, wi.offset)
-			if (maxWi.fid != vlog.cloudMaxFid || (maxWi.offset - vlog.cloudWritableLogOffset) > 1000000){
+			if maxWi.fid < wi.fid {
+				maxWi.fid = wi.fid
+				maxWi.offset = wi.offset
+			} else {
+				maxWi.offset = max(maxWi.offset, wi.offset)
+			}
+
+			if (maxWi.fid != vlog.cloudMaxFid || (maxWi.offset - vlog.cloudWritableLogOffset) > vlog.cloudSyncBufferSize){
 				// If block enough data for sync, or vlog file has changed, try to do a sync
 				select{
 				case pendingCh <- struct{}{}:
@@ -641,19 +733,30 @@ func (vlog *valueLog) doCloudSync(lc *y.Closer){
 
 		closeCase:
 			close(vlog.cloudSyncCh)
+			// Flush the channel
+			for wi := range vlog.cloudSyncCh {
+				maxWi.fid = max(maxWi.fid, wi.fid)
+				maxWi.offset = max(maxWi.offset, wi.offset)
+			}
 			// When the previous syncData finishes, go syncData to do the last data sync
 			pendingCh <- struct{}{}
-			go syncData()
+			syncData(maxWi.fid, maxWi.offset, true)
 			return
 
 		syncCase:
-			go syncData()
+			go syncData(maxWi.fid, maxWi.offset, false)
 	}
 }
 
 func (vlog *valueLog) Close() error {
 	vlog.elog.Printf("Stopping garbage collection of values.")
 	defer vlog.elog.Finish()
+
+	// Signal HasBeenClosed for vlog.cloudSyncCh
+	// Wait for doCloudSync to finish using defer lc.Done()
+	vlog.cloudCloser.SignalAndWait()
+	// Finally close the sync file on cloud
+	vlog.cloudFd.Close()
 
 	var err error
 	for id, f := range vlog.filesMap {
@@ -676,10 +779,6 @@ func (vlog *valueLog) Close() error {
 		}
 
 	}
-
-	// Signal HasBeenClosed for vlog.cloudSyncCh
-	// Wait for doCloudSync to finish using defer lc.Done()
-	vlog.cloudCloser.SignalAndWait()
 
 	return err
 }
@@ -815,7 +914,7 @@ func (vlog *valueLog) write(reqs []*request) error {
 		}
 
 		// TODO: Not sure if this require some lock related thing?
-		vlog.cloudSyncCh <- WriteInfo{vlog.maxFid, vlog.writableLogOffset}
+		vlog.cloudSyncCh <- WriteInfo{vlog.maxFid, vlog.writableOffset()}
 		return nil
 	}
 
