@@ -103,6 +103,6 @@ var DefaultOptions = Options{
 	SyncWrites:              true,
 	// Nothing to read/write value log using standard File I/O
 	// MemoryMap to mmap() the value log files
-	ValueLogFileSize: 1 << 30,
+	ValueLogFileSize: 1 << 27,
 	ValueThreshold:   20,
 }

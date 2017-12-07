@@ -3,7 +3,11 @@ package badger
 import (
 	"bufio"
 	"encoding/binary"
+	"errors"
+	"fmt"
 	"io"
+	"io/ioutil"
+	"os"
 	"sync"
 
 	"github.com/dgraph-io/badger/y"
@@ -21,6 +25,160 @@ func writeTo(entry *protos.KVPair, w io.Writer) error {
 	}
 	_, err = w.Write(buf)
 	return err
+}
+
+// Parse meta data. Return <transaction-type> <operation-type>
+// If <transaction-type> == -1: transaction ends
+// If <transaction-type> == 0: is transaction operation
+// If <transaction-type> == 1: is not transaction operation
+
+// If <operation-type> == 0: is set
+// If <operation-type> == 1: is delete
+func parseMeta(meta byte) (int, int) {
+    if (meta & bitFinTxn) != 0 {
+        // Transaction end
+        return -1, 0
+	}
+	opType := 0
+	if (meta & bitDelete) != 0 {
+		opType = 1
+	}
+	txnType := 1
+	if (meta & bitTxn) != 0 {
+		txnType = 0
+	}
+    return txnType, opType
+}
+
+// Restore badger from a single VLog file
+// This replays all the entries in a vlog file
+func (db *DB) LoadSingleVLog(filename string, txn *Txn) (*Txn, error) {
+    // Create a buf, load data from vlog chunk by chunk
+    // Currently, use 10M as chunk size
+    // If a single entity is larger than 10M, this will fail
+    bufSize := 10 * 1024 * 1024
+	buffer := make([]byte, bufSize)
+
+	// Create an empty header info, for future decode
+	h := header {
+		klen:      0,
+		vlen:      0,
+		expiresAt: 0,
+		meta:      0,
+		userMeta:  0,
+	}
+
+    in_flags := os.O_RDONLY
+    fin, errin := os.OpenFile(filename, in_flags, 0666)
+    if errin != nil {
+        fmt.Println("Error open input")
+    }
+
+	// How many bytes are left in the last read from vlog
+	remain := 0
+
+    for {
+		// Read from vlog to buf, buffer[:remain] contains the data from last read
+		n_read, err := fin.Read(buffer[remain:])
+        if err != nil {
+            fmt.Println("Error loading VLog file")
+		}
+		
+		// Total length of valid data in this buffer
+		bufValidLen := n_read + remain
+
+		localOffset := 0
+		for localOffset < bufValidLen {
+			// Entry by entry decode and replay
+
+			h.Decode(buffer[localOffset:])
+			// 4 is 32bit crc checksum length
+			entryTotalLen := int(headerBufSize + h.klen + h.vlen + 4)
+			if (entryTotalLen + localOffset) > bufValidLen {
+				// This entry is not complete in current buffer, need data from next read
+				break
+			}
+
+			txnType, opType := parseMeta(h.meta)
+
+			if txnType == 1 {
+				// TODO: How to deal with no transaction write?
+				// Currently assume that all writes are transactional
+				fmt.Println("Currently does not support no transaction write")
+				return nil, errors.New("Found entry not in transaction")
+			} else if txnType == -1 {
+				// Close transaction
+				if txn == nil {
+					// Close transaction error
+					fmt.Println("Error, try to close a transaction when no transaction is found")
+					return nil, errors.New("Try to close a transaction when no transaction is found")
+				}
+				y.Check(txn.Commit(nil))
+				txn = nil
+			} else if txnType == 0 {
+				// In a transaction
+				if txn == nil {
+					txn = db.NewTransaction(true)
+				}
+
+				// 8 is for uint64 commitTs, the key in vlog is y.KeyWithTs(txnKey, commitTs)
+				// See transaction.go line 400 for details
+				// Remove this commitTs to get the real key and replay the add/delete
+				key := make([]byte, h.klen - 8)
+				kstart := uint32(localOffset + headerBufSize)
+				copy(key, buffer[kstart: kstart + h.klen - 8])
+				if opType == 0 {
+					value := make([]byte, h.vlen)
+					vstart := uint32(kstart + h.klen)
+					copy(value, buffer[vstart : vstart + h.vlen])
+					y.Check(txn.Set(key, value))
+				} else {
+					y.Check(txn.Delete(key))
+				}
+			}
+
+			localOffset += entryTotalLen
+		}
+
+		// The remaining data in the end of previous buffer,
+		// copy them to the start of new buffer, and load data from file in the next loop
+		copy(buffer, buffer[localOffset:])
+		remain = bufValidLen - localOffset
+
+		// If the total amount of data is less than bufSize, end of file, break
+        if bufValidLen != bufSize {
+            break
+        }
+	}
+	
+	fin.Close()
+
+    return txn, nil
+}
+
+// Restore badger from a series of VLog files, replay all the records in VLog
+// Parameter is the directory ofr vlog file
+func (db *DB) LoadFromVLog(dir string) error {
+	files, err := ioutil.ReadDir(dir)
+	if err != nil {
+		fmt.Println("Error opening vlog directory: " + dir)
+		return err
+	}
+
+	var txn *Txn = nil
+	
+	for _, f := range files {
+		txn, err = db.LoadSingleVLog(dir + "/" + f.Name(), txn)
+		if err != nil {
+			fmt.Println("Error restore vlog file: " + f.Name())
+			return err
+		}
+	}
+
+	if txn != nil {
+		fmt.Println("Error does not end with a transaction end")
+	}
+	return nil
 }
 
 // Backup dumps a protobuf-encoded list of all entries in the database into the
