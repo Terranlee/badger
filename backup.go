@@ -35,9 +35,9 @@ func writeTo(entry *protos.KVPair, w io.Writer) error {
 // If <operation-type> == 0: is set
 // If <operation-type> == 1: is delete
 func parseMeta(meta byte) (int, int) {
-    if (meta & bitFinTxn) != 0 {
-        // Transaction end
-        return -1, 0
+	if (meta & bitFinTxn) != 0 {
+		// Transaction end
+		return -1, 0
 	}
 	opType := 0
 	if (meta & bitDelete) != 0 {
@@ -47,20 +47,20 @@ func parseMeta(meta byte) (int, int) {
 	if (meta & bitTxn) != 0 {
 		txnType = 0
 	}
-    return txnType, opType
+	return txnType, opType
 }
 
 // Restore badger from a single VLog file
 // This replays all the entries in a vlog file
 func (db *DB) LoadSingleVLog(filename string, txn *Txn) (*Txn, error) {
-    // Create a buf, load data from vlog chunk by chunk
-    // Currently, use 10M as chunk size
-    // If a single entity is larger than 10M, this will fail
-    bufSize := 10 * 1024 * 1024
+	// Create a buf, load data from vlog chunk by chunk
+	// Currently, use 10M as chunk size
+	// If a single entity is larger than 10M, this will fail
+	bufSize := 10 * 1024 * 1024
 	buffer := make([]byte, bufSize)
 
 	// Create an empty header info, for future decode
-	h := header {
+	h := header{
 		klen:      0,
 		vlen:      0,
 		expiresAt: 0,
@@ -68,28 +68,31 @@ func (db *DB) LoadSingleVLog(filename string, txn *Txn) (*Txn, error) {
 		userMeta:  0,
 	}
 
-    in_flags := os.O_RDONLY
-    fin, errin := os.OpenFile(filename, in_flags, 0666)
-    if errin != nil {
-        fmt.Println("Error open input")
-    }
+	in_flags := os.O_RDONLY
+	fin, errin := os.OpenFile(filename, in_flags, 0666)
+	if errin != nil {
+		fmt.Println("Error open input")
+	}
 
 	// How many bytes are left in the last read from vlog
 	remain := 0
 
-    for {
+	for {
 		// Read from vlog to buf, buffer[:remain] contains the data from last read
 		n_read, err := fin.Read(buffer[remain:])
-        if err != nil {
-            fmt.Println("Error loading VLog file")
+		if err != nil {
+			fmt.Println("Error loading VLog file")
 		}
-		
+
 		// Total length of valid data in this buffer
 		bufValidLen := n_read + remain
 
 		localOffset := 0
 		for localOffset < bufValidLen {
 			// Entry by entry decode and replay
+			if localOffset+18 >= bufValidLen {
+				break
+			}
 
 			h.Decode(buffer[localOffset:])
 			// 4 is 32bit crc checksum length
@@ -124,13 +127,13 @@ func (db *DB) LoadSingleVLog(filename string, txn *Txn) (*Txn, error) {
 				// 8 is for uint64 commitTs, the key in vlog is y.KeyWithTs(txnKey, commitTs)
 				// See transaction.go line 400 for details
 				// Remove this commitTs to get the real key and replay the add/delete
-				key := make([]byte, h.klen - 8)
+				key := make([]byte, h.klen-8)
 				kstart := uint32(localOffset + headerBufSize)
-				copy(key, buffer[kstart: kstart + h.klen - 8])
+				copy(key, buffer[kstart:kstart+h.klen-8])
 				if opType == 0 {
 					value := make([]byte, h.vlen)
 					vstart := uint32(kstart + h.klen)
-					copy(value, buffer[vstart : vstart + h.vlen])
+					copy(value, buffer[vstart:vstart+h.vlen])
 					y.Check(txn.Set(key, value))
 				} else {
 					y.Check(txn.Delete(key))
@@ -146,14 +149,14 @@ func (db *DB) LoadSingleVLog(filename string, txn *Txn) (*Txn, error) {
 		remain = bufValidLen - localOffset
 
 		// If the total amount of data is less than bufSize, end of file, break
-        if bufValidLen != bufSize {
-            break
-        }
+		if bufValidLen != bufSize {
+			break
+		}
 	}
-	
+
 	fin.Close()
 
-    return txn, nil
+	return txn, nil
 }
 
 // Restore badger from a series of VLog files, replay all the records in VLog
@@ -166,9 +169,9 @@ func (db *DB) LoadFromVLog(dir string) error {
 	}
 
 	var txn *Txn = nil
-	
+
 	for _, f := range files {
-		txn, err = db.LoadSingleVLog(dir + "/" + f.Name(), txn)
+		txn, err = db.LoadSingleVLog(dir+"/"+f.Name(), txn)
 		if err != nil {
 			fmt.Println("Error restore vlog file: " + f.Name())
 			return err
