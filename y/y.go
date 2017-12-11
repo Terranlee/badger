@@ -91,7 +91,15 @@ func Copy(a []byte) []byte {
 func KeyWithTs(key []byte, ts uint64) []byte {
 	out := make([]byte, len(key)+8)
 	copy(out, key)
-	binary.BigEndian.PutUint64(out[len(key):], math.MaxUint64-ts)
+	binary.LittleEndian.PutUint64(out[len(key):], math.MaxUint64-ts)
+	return out
+}
+
+// KeyWithTsNotReverse keep the original key
+func KeyWithTsNotReverse(key []byte, ts uint64) []byte {
+	out := make([]byte, len(key)+8)
+	copy(out, key)
+	binary.LittleEndian.PutUint64(out[len(key):], ts)
 	return out
 }
 
@@ -100,7 +108,7 @@ func ParseTs(key []byte) uint64 {
 	if len(key) <= 8 {
 		return 0
 	}
-	return math.MaxUint64 - binary.BigEndian.Uint64(key[len(key)-8:])
+	return math.MaxUint64 - binary.LittleEndian.Uint64(key[len(key)-8:])
 }
 
 // CompareKeys checks the key without timestamp and checks the timestamp if keyNoTs
