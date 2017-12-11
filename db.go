@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"container/heap"
 	"expvar"
+	"fmt"
 	"log"
 	"math"
 	"os"
@@ -70,6 +71,11 @@ type DB struct {
 	vptr      valuePointer // less than or equal to a pointer to the last vlog value put into mt
 	writeCh   chan *request
 	flushChan chan flushTask // For flushing memtables.
+
+	// A channel for snapshot
+	// Currently this lives in DB, when doWrites finishes to local disk, create a snapshot
+	// If want to create a snapshot after cloudsync is over, may need to move this to db.vlog
+	snapshotCh chan string
 
 	orc *oracle
 }
@@ -233,6 +239,9 @@ func Open(opt Options) (db *DB, err error) {
 		imm:           make([]*skl.Skiplist, 0, opt.NumMemtables),
 		flushChan:     make(chan flushTask, opt.NumMemtables),
 		writeCh:       make(chan *request, kvWriteChCapacity),
+		// Create a channel for snapshot, pass a snapshot name
+		// Only allow 1 snapshot at the same time
+		snapshotCh:    make(chan string, 1),
 		opt:           opt,
 		manifest:      manifestFile,
 		elog:          trace.NewEventLog("Badger", "DB"),
@@ -605,12 +614,16 @@ func (db *DB) doWrites(lc *y.Closer) {
 	y.PendingWrites.Set(db.opt.Dir, reqLen)
 
 	reqs := make([]*request, 0, 10)
+	var snapshotName string
 	for {
 		var r *request
 		select {
 		case r = <-db.writeCh:
 		case <-lc.HasBeenClosed():
 			goto closedCase
+		// Goto snapshot logic
+		case snapshotName = <-db.snapshotCh:
+			goto snapshotCase
 		}
 
 		for {
@@ -646,6 +659,31 @@ func (db *DB) doWrites(lc *y.Closer) {
 		go writeRequests(reqs)
 		reqs = make([]*request, 0, 10)
 		reqLen.Set(0)
+		continue
+	
+	snapshotCase:
+		// Collect all writes in channel
+		for r := range db.writeCh {
+			reqs = append(reqs, r)
+		}
+
+		// Synchronously write to local disk
+		pendingCh <- struct{}{}
+		writeRequests(reqs)
+
+		f, err := os.OpenFile(db.opt.Dir + string(os.PathSeparator) + "SNAPSHOTS", os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0666)
+		if err != nil {
+			log.Printf("Can not open snapshot file")
+		}
+
+		fid := db.vlog.maxFid
+		filename := fmt.Sprintf("%06d.vlog", fid)
+		offset := db.vlog.writableOffset()
+
+		// <Snapshot-Name>:<Filename>:<Offset>
+		f.WriteString(snapshotName + ":" + filename + ":" + strconv.Itoa(int(offset)) + "\n")
+
+		f.Close()
 	}
 }
 

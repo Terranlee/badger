@@ -8,6 +8,9 @@ import (
 	"io"
 	"io/ioutil"
 	"os"
+	"sort"
+	"strings"
+	"strconv"
 	"sync"
 
 	"github.com/dgraph-io/badger/y"
@@ -52,7 +55,7 @@ func parseMeta(meta byte) (int, int) {
 
 // Restore badger from a single VLog file
 // This replays all the entries in a vlog file
-func (db *DB) LoadSingleVLog(filename string, txn *Txn) (*Txn, error) {
+func (db *DB) LoadSingleVLog(filename string, txn *Txn, end int) (*Txn, error) {
 	// Create a buf, load data from vlog chunk by chunk
 	// Currently, use 10M as chunk size
 	// If a single entity is larger than 10M, this will fail
@@ -76,6 +79,8 @@ func (db *DB) LoadSingleVLog(filename string, txn *Txn) (*Txn, error) {
 
 	// How many bytes are left in the last read from vlog
 	remain := 0
+	// Global offset used for loading snapshot
+	globalOffset := 0
 
 	for {
 		// Read from vlog to buf, buffer[:remain] contains the data from last read
@@ -141,6 +146,17 @@ func (db *DB) LoadSingleVLog(filename string, txn *Txn) (*Txn, error) {
 			}
 
 			localOffset += entryTotalLen
+
+			// For loading snapshot
+			globalOffset += entryTotalLen
+			if end != -1 && globalOffset == end {
+				break
+			}
+		}
+
+		// For loading snapshot
+		if end != -1 && globalOffset == end {
+			break
 		}
 
 		// The remaining data in the end of previous buffer,
@@ -159,21 +175,75 @@ func (db *DB) LoadSingleVLog(filename string, txn *Txn) (*Txn, error) {
 	return txn, nil
 }
 
+// Get all vlog files from a directory
+// Vlogs are sorted by filename
+func GetAllVLogFiles(dir string) ([]string, error) {
+	var vlogs []string
+
+	files, err := ioutil.ReadDir(dir)
+	if err != nil {
+		fmt.Println("Err opening vlog directory: " + dir)
+		return nil, err
+	}
+
+	for _, f := range files {
+		if strings.HasSuffix(f.Name(), ".vlog") {
+			vlogs = append(vlogs, f.Name())
+		}
+	}
+
+	sort.Strings(vlogs)
+
+	for _, v := range vlogs {
+		fmt.Println(v)
+	}
+
+	return vlogs, nil
+}
+
+// Find the corresponding filename and offset of a snapshot
+// If no snapshot if found, return ("", -1)
+func FindSnapshotName(dir, snapshotName string) (string, int) {
+	snapshots := dir + string(os.PathSeparator) + "SNAPSHOTS"
+	file, err := os.Open(snapshots)
+	if err != nil {
+		fmt.Println("Error open SNAPSHOTS file")
+		return "", -1
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		snapshot := scanner.Text()
+		strs := strings.Split(snapshot, ":")
+		if strs[0] == snapshotName {
+			filename := strs[1]
+			offset, err := strconv.Atoi(strs[2])
+			if err != nil {
+				fmt.Println("Can not parse offset value")
+				return "", -1
+			}
+			return filename, offset
+		}
+	}
+	return "", -1
+}
+
 // Restore badger from a series of VLog files, replay all the records in VLog
 // Parameter is the directory ofr vlog file
 func (db *DB) LoadFromVLog(dir string) error {
-	files, err := ioutil.ReadDir(dir)
+	vlogs, err := GetAllVLogFiles(dir)
 	if err != nil {
-		fmt.Println("Error opening vlog directory: " + dir)
+		fmt.Println("Error getting vlog files")
 		return err
 	}
 
 	var txn *Txn = nil
 
-	for _, f := range files {
-		txn, err = db.LoadSingleVLog(dir+"/"+f.Name(), txn)
+	for _, v := range vlogs {
+		txn, err = db.LoadSingleVLog(dir + string(os.PathSeparator) + v, txn, -1)
 		if err != nil {
-			fmt.Println("Error restore vlog file: " + f.Name())
+			fmt.Println("Error restore vlog file: " + v)
 			return err
 		}
 	}
@@ -182,6 +252,56 @@ func (db *DB) LoadFromVLog(dir string) error {
 		fmt.Println("Error does not end with a transaction end")
 	}
 	return nil
+}
+
+// Restore badger from a series of VLog files,
+// Only restore to a specific snapshot point in vlog
+func (db *DB) LoadFromVLogToSnapshot(dir, snapshotName string) error {
+	// Get the vlog filename and offset of a snapshot
+	vlogFile, vlogOffset := FindSnapshotName(dir, snapshotName)
+	if vlogOffset == -1 {
+		fmt.Println("Can not find corresponding snapshot" + snapshotName)
+		return errors.New("Can not find corresponding snapshot name" + snapshotName)
+	}
+
+	vlogs, err := GetAllVLogFiles(dir)
+	if err != nil {
+		fmt.Println("Error getting vlog files")
+		return err
+	}
+	
+	var txn *Txn = nil
+
+	for _, v := range vlogs {
+		// If it is the last file, use vlogOffset
+		// Else, load the whole file
+		offset := -1
+		if v == vlogFile {
+			offset = vlogOffset
+		}
+
+		txn, err = db.LoadSingleVLog(dir + string(os.PathSeparator) + v, txn, offset)
+
+		if err != nil {
+			fmt.Println("Error restore vlog file: " + v)
+			return err
+		}
+
+		if v == vlogFile {
+			break;
+		}
+	}
+
+	if txn != nil {
+		fmt.Println("Error does not end with a transaction end")
+	}
+	return nil
+}
+
+func (db *DB) Snapshot(snapshotName string) {
+	// Push snapshotName into snapshotCh
+	// Other things are in db.doWrites()
+	db.snapshotCh <- snapshotName
 }
 
 // Backup dumps a protobuf-encoded list of all entries in the database into the
