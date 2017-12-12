@@ -662,8 +662,11 @@ func (db *DB) doWrites(lc *y.Closer) {
 		continue
 	
 	snapshotCase:
+		fmt.Println("Start snapshot")
 		// Collect all writes in channel
-		for r := range db.writeCh {
+		// don't use for := range, that requires the channel to be closed
+		for len(db.writeCh) > 0 {
+			r = <- db.writeCh
 			reqs = append(reqs, r)
 		}
 
@@ -684,6 +687,8 @@ func (db *DB) doWrites(lc *y.Closer) {
 		f.WriteString(snapshotName + ":" + filename + ":" + strconv.Itoa(int(offset)) + "\n")
 
 		f.Close()
+
+		fmt.Println("Finish snapshot")
 	}
 }
 
