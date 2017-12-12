@@ -86,6 +86,9 @@ type entry struct {
 
 	// Fields maintained internally.
 	offset uint32
+
+	timestamp    uint64
+	hasTimestamp bool
 }
 
 func (e *entry) estimateSize(threshold int) int {

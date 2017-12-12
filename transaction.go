@@ -21,6 +21,7 @@ import (
 	"container/heap"
 	"fmt"
 	"math"
+	"sort"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -230,6 +231,18 @@ func (txn *Txn) SetWithTTL(key, val []byte, dur time.Duration) error {
 	return txn.setEntry(e)
 }
 
+// SetWithTs adds a key-value pair to DB, along with a timestamp.
+// supposed to be only called by backup when restoring the original DB.
+func (txn *Txn) SetWithTs(key, val []byte, ts uint64) error {
+	entryWithTs := &entry{
+		Key:          key,
+		Value:        val,
+		timestamp:    ts,
+		hasTimestamp: true,
+	}
+	return txn.setEntry(entryWithTs)
+}
+
 func (txn *Txn) setEntry(e *entry) error {
 	switch {
 	case !txn.update:
@@ -375,7 +388,7 @@ func (txn *Txn) Discard() {
 //
 // If error is nil, the transaction is successfully committed. In case of a non-nil error, the LSM
 // tree won't be updated, so there's no need for any rollback.
-func (txn *Txn) Commit(callback func(error)) error {
+func (txn *Txn) Commit(callback func(error), finTimestamp ...uint64) error {
 	if txn.commitTs == 0 && txn.db.opt.managedTxns {
 		return ErrManagedTxn
 	}
@@ -398,15 +411,34 @@ func (txn *Txn) Commit(callback func(error)) error {
 	for _, e := range txn.pendingWrites {
 		// Suffix the keys with commit ts, so the key versions are sorted in
 		// descending order of commit timestamp.
-		e.Key = y.KeyWithTs(e.Key, commitTs)
+		if e.hasTimestamp {
+			e.Key = y.KeyWithTsNotReverse(e.Key, e.timestamp)
+		} else {
+			e.Key = y.KeyWithTs(e.Key, commitTs)
+		}
 		e.meta |= bitTxn
 		entries = append(entries, e)
 	}
+
+	sort.Slice(entries[:], func(i, j int) bool {
+		return string((*entries[i]).Key) < string((*entries[j]).Key)
+	})
+
+	var finalKey []byte
+	var finalVal []byte
+	if len(finTimestamp) != 0 {
+		finalKey = y.KeyWithTsNotReverse(txnKey, finTimestamp[0])
+		finalVal = []byte(strconv.FormatUint(math.MaxUint64-finTimestamp[0], 10))
+	} else {
+		finalKey = y.KeyWithTs(txnKey, commitTs)
+		finalVal = []byte(strconv.FormatUint(commitTs, 10))
+	}
 	e := &entry{
-		Key:   y.KeyWithTs(txnKey, commitTs),
-		Value: []byte(strconv.FormatUint(commitTs, 10)),
+		Key:   finalKey,
+		Value: finalVal,
 		meta:  bitFinTxn,
 	}
+
 	entries = append(entries, e)
 
 	if callback == nil {

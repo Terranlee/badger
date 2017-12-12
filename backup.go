@@ -9,8 +9,8 @@ import (
 	"io/ioutil"
 	"os"
 	"sort"
-	"strings"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/dgraph-io/badger/y"
@@ -121,7 +121,12 @@ func (db *DB) LoadSingleVLog(filename string, txn *Txn, end int) (*Txn, error) {
 					fmt.Println("Error, try to close a transaction when no transaction is found")
 					return nil, errors.New("Try to close a transaction when no transaction is found")
 				}
-				y.Check(txn.Commit(nil))
+				tsBytes := make([]byte, 8)
+				kstart := uint32(localOffset + headerBufSize)
+				copy(tsBytes, buffer[kstart+h.klen-8:kstart+h.klen])
+				originTs := binary.LittleEndian.Uint64(tsBytes)
+
+				y.Check(txn.Commit(nil, originTs))
 				txn = nil
 			} else if txnType == 0 {
 				// In a transaction
@@ -133,13 +138,17 @@ func (db *DB) LoadSingleVLog(filename string, txn *Txn, end int) (*Txn, error) {
 				// See transaction.go line 400 for details
 				// Remove this commitTs to get the real key and replay the add/delete
 				key := make([]byte, h.klen-8)
+				tsBytes := make([]byte, 8)
+
 				kstart := uint32(localOffset + headerBufSize)
 				copy(key, buffer[kstart:kstart+h.klen-8])
+				copy(tsBytes, buffer[kstart+h.klen-8:kstart+h.klen])
+				originTs := binary.LittleEndian.Uint64(tsBytes)
 				if opType == 0 {
 					value := make([]byte, h.vlen)
 					vstart := uint32(kstart + h.klen)
 					copy(value, buffer[vstart:vstart+h.vlen])
-					y.Check(txn.Set(key, value))
+					y.Check(txn.SetWithTs(key, value, originTs))
 				} else {
 					y.Check(txn.Delete(key))
 				}
@@ -241,10 +250,54 @@ func (db *DB) LoadFromVLog(dir string) error {
 	var txn *Txn = nil
 
 	for _, v := range vlogs {
-		txn, err = db.LoadSingleVLog(dir + string(os.PathSeparator) + v, txn, -1)
+		txn, err = db.LoadSingleVLog(dir+string(os.PathSeparator)+v, txn, -1)
 		if err != nil {
 			fmt.Println("Error restore vlog file: " + v)
 			return err
+		}
+	}
+
+	if txn != nil {
+		fmt.Println("Error does not end with a transaction end")
+	}
+	return nil
+}
+
+// Restore badger from a series of VLog files,
+// Only restore to a specific snapshot point in vlog
+func (db *DB) LoadFromVLogToSnapshot(dir, snapshotName string) error {
+	// Get the vlog filename and offset of a snapshot
+	vlogFile, vlogOffset := FindSnapshotName(dir, snapshotName)
+	if vlogOffset == -1 {
+		fmt.Println("Can not find corresponding snapshot" + snapshotName)
+		return errors.New("Can not find corresponding snapshot name" + snapshotName)
+	}
+
+	vlogs, err := GetAllVLogFiles(dir)
+	if err != nil {
+		fmt.Println("Error getting vlog files")
+		return err
+	}
+
+	var txn *Txn = nil
+
+	for _, v := range vlogs {
+		// If it is the last file, use vlogOffset
+		// Else, load the whole file
+		offset := -1
+		if v == vlogFile {
+			offset = vlogOffset
+		}
+
+		txn, err = db.LoadSingleVLog(dir+string(os.PathSeparator)+v, txn, offset)
+
+		if err != nil {
+			fmt.Println("Error restore vlog file: " + v)
+			return err
+		}
+
+		if v == vlogFile {
+			break
 		}
 	}
 
