@@ -431,8 +431,8 @@ type lfDiscardStats struct {
 }
 
 // CloudSync
-type WriteInfo struct{
-	fid uint32
+type WriteInfo struct {
+	fid    uint32
 	offset uint32
 }
 
@@ -462,12 +462,12 @@ type valueLog struct {
 
 	// CloudSync buffer
 	cloudSyncBufferSize uint32
-	cloudSyncBuffer []byte
+	cloudSyncBuffer     []byte
 
 	// Cloud file description
-	cloudFd *os.File
-	cloudDir string
-	cloudMaxFid uint32
+	cloudFd                *os.File
+	cloudDir               string
+	cloudMaxFid            uint32
 	cloudWritableLogOffset uint32
 }
 
@@ -592,7 +592,7 @@ func (vlog *valueLog) Open(kv *DB, opt Options) error {
 	}
 
 	// Currently use the sync buffer size as 10M
-	vlog.cloudSyncBufferSize = 10 * 1024 * 1024
+	vlog.cloudSyncBufferSize = 1 * 1024 * 1024
 	vlog.cloudSyncBuffer = make([]byte, vlog.cloudSyncBufferSize)
 
 	// TODO: Currently set this channel max size to 100
@@ -604,10 +604,10 @@ func (vlog *valueLog) Open(kv *DB, opt Options) error {
 	return nil
 }
 
-func (vlog *valueLog) doCloudSync(lc *y.Closer){
+func (vlog *valueLog) doCloudSync(lc *y.Closer) {
 	defer lc.Done()
-	pendingCh := make(chan struct{}, 1)	// blocking queue, make sure only one sync happens at a time
-	
+	pendingCh := make(chan struct{}, 1) // blocking queue, make sure only one sync happens at a time
+
 	var maxWi WriteInfo
 	var wi WriteInfo
 
@@ -617,13 +617,13 @@ func (vlog *valueLog) doCloudSync(lc *y.Closer){
 		// If <is_whole> is false, sync current file to offset
 		// <is_close> means if it is during database close
 		fd := vlog.filesMap[vlog.cloudMaxFid].fd
-		
+
 		ending := int64(offset)
 		current := int64(vlog.cloudWritableLogOffset)
 
 		for {
 			// In non whole sync mode, make sure every sync has 10M data
-			if is_whole == false && uint32(ending - current) < vlog.cloudSyncBufferSize {
+			if is_whole == false && uint32(ending-current) < vlog.cloudSyncBufferSize {
 				break
 			}
 
@@ -643,7 +643,7 @@ func (vlog *valueLog) doCloudSync(lc *y.Closer){
 					n_write = max_write
 				}
 			}
-			
+
 			n_write_real, err := vlog.cloudFd.Write(vlog.cloudSyncBuffer[:n_write])
 			if err != nil {
 				log.Println("Error in cloud sync write")
@@ -653,7 +653,7 @@ func (vlog *valueLog) doCloudSync(lc *y.Closer){
 			// If the data you write is not the whole buffer size,
 			// this means you reach the end of a file, or reach the maximum offset
 			if uint32(n_write) != vlog.cloudSyncBufferSize {
-				break;
+				break
 			}
 		}
 
@@ -676,7 +676,7 @@ func (vlog *valueLog) doCloudSync(lc *y.Closer){
 		}
 	}
 
-	syncData := func(fid, offset uint32, is_close bool){
+	syncData := func(fid, offset uint32, is_close bool) {
 		start_fid := int(vlog.cloudMaxFid)
 		end_fid := int(fid)
 		// For all previous file, sync whole file
@@ -685,26 +685,26 @@ func (vlog *valueLog) doCloudSync(lc *y.Closer){
 		}
 		// For current file, sync to offset
 		// Or if during database close, sync to whole last file
-		syncSingleFile(false || is_close, is_close, offset)
+		syncSingleFile(is_close, is_close, offset)
 		// Unblock the queue
-		<- pendingCh
+		<-pendingCh
 	}
 
 	max := func(x, y uint32) uint32 {
-		if(x < y){
+		if x < y {
 			return y
 		}
 		return x
 	}
 
 	for {
-		select{
-		case wi = <- vlog.cloudSyncCh:
-		case <- lc.HasBeenClosed():
+		select {
+		case wi = <-vlog.cloudSyncCh:
+		case <-lc.HasBeenClosed():
 			goto closeCase
 		}
 
-		for{
+		for {
 			// If new sync request has come
 			if maxWi.fid < wi.fid {
 				maxWi.fid = wi.fid
@@ -713,9 +713,9 @@ func (vlog *valueLog) doCloudSync(lc *y.Closer){
 				maxWi.offset = max(maxWi.offset, wi.offset)
 			}
 
-			if (maxWi.fid != vlog.cloudMaxFid || (maxWi.offset - vlog.cloudWritableLogOffset) > vlog.cloudSyncBufferSize){
+			if maxWi.fid != vlog.cloudMaxFid || (maxWi.offset-vlog.cloudWritableLogOffset) > vlog.cloudSyncBufferSize {
 				// If block enough data for sync, or vlog file has changed, try to do a sync
-				select{
+				select {
 				case pendingCh <- struct{}{}:
 					// If the pendingCh is not blocking, goto syncCase
 					goto syncCase
@@ -724,27 +724,27 @@ func (vlog *valueLog) doCloudSync(lc *y.Closer){
 				}
 			}
 
-			select{
-			case wi = <- vlog.cloudSyncCh:
-			case <- lc.HasBeenClosed():
+			select {
+			case wi = <-vlog.cloudSyncCh:
+			case <-lc.HasBeenClosed():
 				goto closeCase
 			}
 		}
 
-		closeCase:
-			close(vlog.cloudSyncCh)
-			// Flush the channel
-			for wi := range vlog.cloudSyncCh {
-				maxWi.fid = max(maxWi.fid, wi.fid)
-				maxWi.offset = max(maxWi.offset, wi.offset)
-			}
-			// When the previous syncData finishes, go syncData to do the last data sync
-			pendingCh <- struct{}{}
-			syncData(maxWi.fid, maxWi.offset, true)
-			return
+	closeCase:
+		close(vlog.cloudSyncCh)
+		// Flush the channel
+		for wi := range vlog.cloudSyncCh {
+			maxWi.fid = max(maxWi.fid, wi.fid)
+			maxWi.offset = max(maxWi.offset, wi.offset)
+		}
+		// When the previous syncData finishes, go syncData to do the last data sync
+		pendingCh <- struct{}{}
+		syncData(maxWi.fid, maxWi.offset, true)
+		return
 
-		syncCase:
-			go syncData(maxWi.fid, maxWi.offset, false)
+	syncCase:
+		go syncData(maxWi.fid, maxWi.offset, false)
 	}
 }
 
@@ -872,6 +872,34 @@ func (vlog *valueLog) writableOffset() uint32 {
 	return atomic.LoadUint32(&vlog.writableLogOffset)
 }
 
+func (vlog *valueLog) checkNeedThrottle() bool {
+	max := func(x, y uint32) uint32 {
+		if x < y {
+			return y
+		}
+		return x
+	}
+	var throttleCommitNumber uint32
+	var byteGap, gap uint32
+	throttleCommitNumber = 1
+	gap = 1
+	byteGap = max(vlog.cloudSyncBufferSize, vlog.cloudSyncBufferSize*throttleCommitNumber)
+
+	// fmt.Println("cloud offset  " + strconv.FormatUint(uint64(vlog.cloudWritableLogOffset), 10))
+
+	if vlog.maxFid > vlog.cloudMaxFid+gap {
+		// fmt.Println("local  " + strconv.FormatUint(uint64(vlog.maxFid), 10))
+		// fmt.Println("cloud  " + strconv.FormatUint(uint64(vlog.cloudMaxFid), 10))
+		return true
+	}
+	if vlog.writableLogOffset > vlog.cloudWritableLogOffset+byteGap {
+		// fmt.Println("local  " + strconv.FormatUint(uint64(vlog.writableLogOffset), 10))
+		// fmt.Println("cloud  " + strconv.FormatUint(uint64(vlog.cloudWritableLogOffset), 10))
+		return true
+	}
+	return false
+}
+
 // write is thread-unsafe by design and should not be called concurrently.
 func (vlog *valueLog) write(reqs []*request) error {
 	vlog.filesLock.RLock()
@@ -879,6 +907,11 @@ func (vlog *valueLog) write(reqs []*request) error {
 	vlog.filesLock.RUnlock()
 
 	toDisk := func() error {
+		if vlog.checkNeedThrottle() {
+			vlog.cloudSyncCh <- WriteInfo{vlog.maxFid, vlog.writableOffset()}
+			return nil
+		}
+
 		if vlog.buf.Len() == 0 {
 			return nil
 		}
