@@ -236,9 +236,9 @@ func Open(opt Options) (db *DB, err error) {
 	heap.Init(&orc.commitMark)
 
 	db = &DB{
-		imm:           make([]*skl.Skiplist, 0, opt.NumMemtables),
-		flushChan:     make(chan flushTask, opt.NumMemtables),
-		writeCh:       make(chan *request, kvWriteChCapacity),
+		imm:       make([]*skl.Skiplist, 0, opt.NumMemtables),
+		flushChan: make(chan flushTask, opt.NumMemtables),
+		writeCh:   make(chan *request, kvWriteChCapacity),
 		// Create a channel for snapshot, pass a snapshot name
 		// Only allow 1 snapshot at the same time
 		snapshotCh:    make(chan string, 1),
@@ -619,15 +619,24 @@ func (db *DB) doWrites(lc *y.Closer) {
 		var r *request
 		select {
 		case r = <-db.writeCh:
+			// fmt.Println("read from writech")
 		case <-lc.HasBeenClosed():
 			goto closedCase
 		// Goto snapshot logic
 		case snapshotName = <-db.snapshotCh:
 			goto snapshotCase
+		default:
+			// fmt.Println("default")
+			continue
 		}
+		// fmt.Println("come over select")
 
 		for {
 			reqs = append(reqs, r)
+
+			// fmt.Print("reqs size is ")
+			// fmt.Println(len(reqs))
+
 			reqLen.Set(int64(len(reqs)))
 
 			if len(reqs) >= 3*kvWriteChCapacity {
@@ -638,6 +647,7 @@ func (db *DB) doWrites(lc *y.Closer) {
 			select {
 			// Either push to pending, or continue to pick from writeCh.
 			case r = <-db.writeCh:
+				// fmt.Println("read from writech")
 			case pendingCh <- struct{}{}:
 				goto writeCase
 			case <-lc.HasBeenClosed():
@@ -650,23 +660,28 @@ func (db *DB) doWrites(lc *y.Closer) {
 		for r := range db.writeCh { // Flush the channel.
 			reqs = append(reqs, r)
 		}
-
+		fmt.Println("close case happending")
 		pendingCh <- struct{}{} // Push to pending before doing a write.
 		writeRequests(reqs)
 		return
 
 	writeCase:
+		if db.vlog.checkNeedThrottle() {
+			<-pendingCh
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
 		go writeRequests(reqs)
 		reqs = make([]*request, 0, 10)
 		reqLen.Set(0)
 		continue
-	
+
 	snapshotCase:
 		fmt.Println("Start snapshot")
 		// Collect all writes in channel
 		// don't use for := range, that requires the channel to be closed
 		for len(db.writeCh) > 0 {
-			r = <- db.writeCh
+			r = <-db.writeCh
 			reqs = append(reqs, r)
 		}
 
@@ -674,7 +689,7 @@ func (db *DB) doWrites(lc *y.Closer) {
 		pendingCh <- struct{}{}
 		writeRequests(reqs)
 
-		f, err := os.OpenFile(db.opt.Dir + string(os.PathSeparator) + "SNAPSHOTS", os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0666)
+		f, err := os.OpenFile(db.opt.Dir+string(os.PathSeparator)+"SNAPSHOTS", os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0666)
 		if err != nil {
 			log.Printf("Can not open snapshot file")
 		}

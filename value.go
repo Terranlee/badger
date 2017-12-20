@@ -628,7 +628,7 @@ func (vlog *valueLog) doCloudSync(lc *y.Closer) {
 			}
 
 			n_read, err := fd.ReadAt(vlog.cloudSyncBuffer, current)
-			log.Println(current, n_read, offset)
+			log.Println(current, n_read, offset, " cloud")
 			if err != nil {
 				//log.Println("Error in cloud sync read")
 				//log.Println(err)
@@ -884,17 +884,14 @@ func (vlog *valueLog) checkNeedThrottle() bool {
 	throttleCommitNumber = 1
 	gap = 1
 	byteGap = max(vlog.cloudSyncBufferSize, vlog.cloudSyncBufferSize*throttleCommitNumber)
-
-	// fmt.Println("cloud offset  " + strconv.FormatUint(uint64(vlog.cloudWritableLogOffset), 10))
-
 	if vlog.maxFid > vlog.cloudMaxFid+gap {
-		// fmt.Println("local  " + strconv.FormatUint(uint64(vlog.maxFid), 10))
-		// fmt.Println("cloud  " + strconv.FormatUint(uint64(vlog.cloudMaxFid), 10))
+		fmt.Println("local  file " + strconv.FormatUint(uint64(vlog.maxFid), 10))
+		fmt.Println("cloud  file " + strconv.FormatUint(uint64(vlog.cloudMaxFid), 10))
 		return true
 	}
 	if vlog.writableLogOffset > vlog.cloudWritableLogOffset+byteGap {
-		// fmt.Println("local  " + strconv.FormatUint(uint64(vlog.writableLogOffset), 10))
-		// fmt.Println("cloud  " + strconv.FormatUint(uint64(vlog.cloudWritableLogOffset), 10))
+		fmt.Println("local  " + strconv.FormatUint(uint64(vlog.writableLogOffset), 10))
+		fmt.Println("cloud  " + strconv.FormatUint(uint64(vlog.cloudWritableLogOffset), 10))
 		return true
 	}
 	return false
@@ -907,10 +904,6 @@ func (vlog *valueLog) write(reqs []*request) error {
 	vlog.filesLock.RUnlock()
 
 	toDisk := func() error {
-		if vlog.checkNeedThrottle() {
-			vlog.cloudSyncCh <- WriteInfo{vlog.maxFid, vlog.writableOffset()}
-			return nil
-		}
 
 		if vlog.buf.Len() == 0 {
 			return nil
@@ -945,7 +938,10 @@ func (vlog *valueLog) write(reqs []*request) error {
 
 			curlf = newlf
 		}
-
+		fmt.Print("cloud sync to : ")
+		fmt.Print(vlog.maxFid)
+		fmt.Print(" : ")
+		fmt.Println(vlog.writableOffset())
 		// TODO: Not sure if this require some lock related thing?
 		vlog.cloudSyncCh <- WriteInfo{vlog.maxFid, vlog.writableOffset()}
 		return nil
